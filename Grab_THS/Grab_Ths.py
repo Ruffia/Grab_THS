@@ -88,6 +88,10 @@ MAIN_FIELDS = {"buy_lg_amount": "大单净额（同花顺主力口径）",
 REQUIRED_COLUMNS = ["TradeDate", "StockCode", "StockName", "Price", "Rise", "FundFlow_MainForce"]
 NUMERIC_COLUMNS = ["Price", "Rise", "FundFlow_MainForce"]
 
+API_RETRIES = 4                 # 接口异常（502/网关错误）时的重试次数
+API_WAIT = 8                    # 每次重试间隔（秒）
+EMPTY_TOLERANCE = 5             # 连续多少个交易日返回空就判定为接口异常
+
 # 幂等写入：同日同股票重复跑不会报错，只更新其余字段
 UPSERT = f'''
 INSERT INTO "{TABLE}" ("TradeDate", "StockCode", "StockName", "Price", "Rise", "FundFlow_MainForce")
@@ -130,31 +134,87 @@ def to_db_date(yyyymmdd: str) -> str:
     return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
 
 
+def is_api_down(df) -> bool:
+    """
+    判断返回值是否代表「接口异常」而不是「当天没有数据」。
+
+    Tushare 服务端 502 / 网关故障时，tushare 库不抛异常，而是返回 0 行 0 列的空表；
+    正常的「当天无数据」会带着完整字段名返回空表（例如 13 列、0 行）。
+    """
+    return df is None or (df.empty and len(df.columns) == 0)
+
+
+def api_down_error(detail: str) -> SystemExit:
+    """接口不可用时给出可执行的排查提示，而不是抛 KeyError。"""
+    return SystemExit(
+        f"Tushare 接口无有效响应：{detail}\n"
+        f"已重试 {API_RETRIES} 次（间隔 {API_WAIT}s）。常见原因：\n"
+        "  1) Tushare 服务端故障（502 Bad Gateway），过几分钟再跑即可；\n"
+        "  2) 本机网络 / 代理拦截，可访问 http://api.tushare.pro 验证；\n"
+        "  3) 该接口积分不足（trade_cal 需 2000 分，moneyflow_ths 需 6000 分）。\n"
+        "手工自检：\n"
+        "    import tushare as ts\n"
+        "    pro = ts.pro_api('你的token')\n"
+        "    print(pro.trade_cal(exchange='SSE', start_date='20261101', end_date='20261110'))")
+
+
 def call_ths(pro, **kwargs) -> pd.DataFrame:
-    """调用 moneyflow_ths，处理频率限制与积分不足。"""
+    """调用 moneyflow_ths，处理频率限制、积分不足与服务端 502。"""
     params = {k: v for k, v in kwargs.items() if v is not None}
-    last_exc = None
-    for attempt in range(3):
+    last_msg = ""
+    for attempt in range(1, API_RETRIES + 1):
         try:
             df = pro.moneyflow_ths(**params)
-            return df if df is not None else pd.DataFrame()
         except Exception as exc:
-            last_exc = exc
-            msg = str(exc)
-            if "每分钟" in msg:
+            last_msg = str(exc)
+            if "每分钟" in last_msg:
                 time.sleep(61)
                 continue
-            if "权限" in msg or "积分" in msg:
-                raise SystemExit(f"moneyflow_ths 调用失败（该接口需 6000 积分）：{msg}")
-            time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(f"moneyflow_ths 调用失败：{last_exc}")
+            if "权限" in last_msg or "积分" in last_msg:
+                raise SystemExit(f"moneyflow_ths 调用失败（该接口需 6000 积分）：{last_msg}")
+            print(f"[警告] 第 {attempt}/{API_RETRIES} 次请求失败：{last_msg[:100]}", file=sys.stderr)
+            time.sleep(API_WAIT)
+            continue
+
+        if is_api_down(df):
+            last_msg = "返回 0 行 0 列（疑似服务端 502 或网关错误）"
+            print(f"[警告] 第 {attempt}/{API_RETRIES} 次请求异常：{last_msg}", file=sys.stderr)
+            time.sleep(API_WAIT)
+            continue
+        return df
+
+    raise api_down_error(f"moneyflow_ths {params} 连续 {API_RETRIES} 次失败，最后一次：{last_msg}")
 
 
 def get_trade_days(pro, start_date: str, end_date: str) -> list:
-    """区间内的交易日（升序）。"""
-    cal = pro.trade_cal(exchange="SSE", start_date=start_date, end_date=end_date,
-                        fields="cal_date,is_open")
-    return sorted(cal.loc[cal["is_open"].astype(int) == 1, "cal_date"].astype(str))
+    """
+    区间内的交易日（升序）。
+
+    trade_cal 同样可能因服务端 502 返回空表，这里显式校验字段并重试，
+    避免直接抛 KeyError: 'is_open' 这种误导性错误。
+    """
+    last_msg = ""
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            cal = pro.trade_cal(exchange="SSE", start_date=start_date, end_date=end_date,
+                                fields="cal_date,is_open")
+        except Exception as exc:
+            cal = None
+            last_msg = str(exc)
+
+        if cal is not None and "is_open" in cal.columns and not cal.empty:
+            return sorted(cal.loc[cal["is_open"].astype(int) == 1, "cal_date"].astype(str))
+
+        if cal is not None and "is_open" in cal.columns:
+            return []                       # 字段正常但区间内无交易日（如全在休市）
+        last_msg = last_msg or "trade_cal 返回 0 行 0 列（疑似服务端 502）"
+        print(f"[警告] 第 {attempt}/{API_RETRIES} 次获取交易日历失败：{last_msg[:100]}",
+              file=sys.stderr)
+        if attempt < API_RETRIES:
+            time.sleep(API_WAIT)
+
+    raise api_down_error(f"trade_cal {start_date}~{end_date} 连续 {API_RETRIES} 次失败，"
+                         f"最后一次：{last_msg}")
 
 
 def recent_trade_days(pro, days: int, end_date: str = None) -> list:
@@ -198,14 +258,20 @@ def fetch_days(pro, dates: list) -> pd.DataFrame:
     earlier = [d for d in get_trade_days(pro, probe_start, dates[0]) if d < dates[0]]
     pool = earlier + dates                      # 前面预留可回补的交易日
 
-    frames, got = [], 0
+    frames, got, misses = [], 0, 0
     for day in reversed(pool):                  # 从最新往前取
         if got >= len(dates):
             break
         df = fetch_one_day(pro, day)
         if df.empty:
+            misses += 1
             print(f"  {day} 无数据（未更新或停市），跳过并向前补一天")
+            if misses >= EMPTY_TOLERANCE:
+                raise SystemExit(
+                    f"连续 {misses} 个交易日都返回空表，接口多半异常（服务端 502 或积分不足），"
+                    "已中止以免反复空转。请先用 trade_cal 自检后重试。")
         else:
+            misses = 0
             if len(df) >= ROW_LIMIT:
                 print(f"  [提醒] {day} 返回 {len(df)} 行，已达单次上限，可能被截断")
             frames.append(df)
